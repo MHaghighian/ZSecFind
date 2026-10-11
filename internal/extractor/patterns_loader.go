@@ -11,9 +11,11 @@ import (
 
 // secretPattern is a compiled secret rule with metadata.
 type secretPattern struct {
-	re          *regexp.Regexp
-	ruleID      string
-	description string
+	re              *regexp.Regexp
+	ruleID          string
+	description     string
+	keywords        []string
+	caseInsensitive bool
 }
 
 // skipBroadPatterns are overly generic regexes that cause noise in passive scans.
@@ -67,10 +69,13 @@ func loadPatternLines(raw, source string, into *[]secretPattern, seen map[string
 		seen[compilePat] = struct{}{}
 
 		ruleID := assignRuleID(source, currentRuleID, currentDesc, compilePat, ruleCounts)
+		kws, _ := extractKeywordsFromPattern(compilePat)
 		*into = append(*into, secretPattern{
-			re:          re,
-			ruleID:      ruleID,
-			description: currentDesc,
+			re:              re,
+			ruleID:          ruleID,
+			description:     currentDesc,
+			keywords:        kws,
+			caseInsensitive: ci || strings.HasPrefix(compilePat, "(?i)"),
 		})
 	}
 }
@@ -143,7 +148,7 @@ func loadAllSecretPatterns(coreRaw, curatedRaw, extraRaw string) []secretPattern
 	return out
 }
 
-func findingsFromRegex(re *regexp.Regexp, data, source, ruleID string) []model.Finding {
+func findingsFromRegex(re *regexp.Regexp, data, source, ruleID string, lineStarts []int) []model.Finding {
 	if re == nil {
 		return nil
 	}
@@ -151,7 +156,9 @@ func findingsFromRegex(re *regexp.Regexp, data, source, ruleID string) []model.F
 	if len(idxs) == 0 {
 		return nil
 	}
-	lineStarts := buildLineStarts(data)
+	if lineStarts == nil {
+		lineStarts = buildLineStarts(data)
+	}
 	out := make([]model.Finding, 0, len(idxs))
 	for _, idx := range idxs {
 		loc := findingAt(data, lineStarts, source, ruleID, idx[0], idx[1])

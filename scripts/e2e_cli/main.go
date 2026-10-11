@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 )
 
 func main() {
@@ -146,9 +147,6 @@ func main() {
 	check("-o output file", code == 0 && readErr == nil && len(data) > 10, fmt.Sprintf("readErr=%v len=%d", readErr, len(data)))
 
 	// stdin
-	code, out, _ = run("-q")
-	// stdin empty when no pipe - might scan . default - skip that path
-	// pipe content instead
 	cmd := exec.Command(bin, "-q")
 	cmd.Stdin = strings.NewReader(`token = "xoxb-1234567890-1234567890-abcdefghijklmnopqrstuvwx"`)
 	var stdout strings.Builder
@@ -158,6 +156,47 @@ func main() {
 	summary, _ = report["summary"].(map[string]any)
 	tf, _ := summary["total_findings"].(float64)
 	check("stdin scan", tf > 0, fmt.Sprintf("findings=%v", tf))
+
+	// Golden: vulnerable-app --only-secrets must hit known vendor prefixes
+	start := time.Now()
+	code, out, _ = run("-q", "--only-secrets", vuln)
+	elapsed := time.Since(start)
+	json.Unmarshal([]byte(out), &report)
+	findings, _ = report["findings"].(map[string]any)
+	secretList, _ = findings["secret"].([]any)
+	secretBlob := ""
+	for _, item := range secretList {
+		if m, ok := item.(map[string]any); ok {
+			if v, ok := m["value"].(string); ok {
+				secretBlob += v + "\n"
+			}
+		}
+	}
+	needles := []string{"AKIA", "ghp_", "hooks.slack.com", "sk_live_", "glpat-", "AIza"}
+	goldenOK := code == 0 && len(secretList) >= 5
+	missing := []string{}
+	for _, n := range needles {
+		if !strings.Contains(secretBlob, n) {
+			missing = append(missing, n)
+			goldenOK = false
+		}
+	}
+	check("golden vulnerable-app --only-secrets", goldenOK,
+		fmt.Sprintf("secrets=%d missing=%v", len(secretList), missing))
+	fmt.Printf("  [INFO] vulnerable-app --only-secrets wall time: %s (%d secrets)\n", elapsed.Round(time.Millisecond), len(secretList))
+
+	// Clean CSS has no secrets under --only-secrets
+	code, out, _ = run("-q", "--only-secrets", css)
+	json.Unmarshal([]byte(out), &report)
+	summary, _ = report["summary"].(map[string]any)
+	hs, _ := summary["has_sensitive"].(bool)
+	secCount, _ := summary["by_category"].(map[string]any)
+	secN := 0.0
+	if secCount != nil {
+		secN, _ = secCount["secret"].(float64)
+	}
+	check("clean css --only-secrets empty", code == 0 && !hs && secN == 0,
+		fmt.Sprintf("has_sensitive=%v secret_count=%v", hs, secN))
 
 	fmt.Println()
 	fmt.Printf("Result: %d passed, %d failed\n", passed, failed)

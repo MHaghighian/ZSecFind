@@ -11,6 +11,7 @@ var (
 	staticExtensions []string
 
 	secretPatterns []secretPattern
+	secretIndex    *secretKeywordIndex
 
 	reSFZ            *regexp.Regexp
 	reMobile         *regexp.Regexp
@@ -52,6 +53,7 @@ func initPatterns() {
 
 		core, curated, extra := patterns.Secrets()
 		secretPatterns = loadAllSecretPatterns(core, curated, extra)
+		secretIndex = buildSecretKeywordIndex(secretPatterns)
 	})
 }
 

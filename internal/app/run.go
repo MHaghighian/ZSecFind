@@ -86,6 +86,10 @@ func Run() int {
 
 	var results []*model.ScanResult
 	hasWork := false
+	cats := categoryAllowlist(onlySecrets, categories)
+	scanOpts := scanner.ScanOptions{Workers: workers, Categories: cats}
+	crawlOpts.Categories = cats
+
 
 	if urls == "" && files == "" && dir == "" && len(positional) == 0 {
 		if stat, _ := os.Stdin.Stat(); (stat.Mode() & os.ModeCharDevice) == 0 {
@@ -94,7 +98,7 @@ func Run() int {
 				fatal(quiet, readErr)
 				return 1
 			}
-			results = append(results, applyFilters(scanner.ScanContent(string(data), "stdin"), onlySecrets, categories))
+			results = append(results, applyFilters(scanner.ScanContentOpts(string(data), "stdin", scanOpts), onlySecrets, categories))
 			hasWork = true
 		}
 	}
@@ -111,7 +115,7 @@ func Run() int {
 
 	for _, f := range splitList(files) {
 		hasWork = true
-		r, err := scanFileTarget(f, quiet)
+		r, err := scanFileTarget(f, scanOpts, quiet)
 		if err != nil {
 			fatal(quiet, err)
 			return 1
@@ -121,7 +125,7 @@ func Run() int {
 
 	if dir != "" {
 		hasWork = true
-		rs, err := scanDirTarget(dir, workers, quiet)
+		rs, err := scanDirTarget(dir, scanOpts, quiet)
 		if err != nil {
 			fatal(quiet, err)
 			return 1
@@ -133,7 +137,7 @@ func Run() int {
 
 	for _, arg := range positional {
 		hasWork = true
-		rs, err := scanTarget(ctx, arg, crawlOpts, noCrawl, workers, quiet)
+		rs, err := scanTarget(ctx, arg, crawlOpts, noCrawl, scanOpts, quiet)
 		if err != nil {
 			fatal(quiet, err)
 			return 1
@@ -144,7 +148,7 @@ func Run() int {
 	}
 
 	if !hasWork {
-		rs, err := scanDirTarget(".", workers, quiet)
+		rs, err := scanDirTarget(".", scanOpts, quiet)
 		if err != nil {
 			fatal(quiet, err)
 			return 1
@@ -178,7 +182,7 @@ func Run() int {
 	return 0
 }
 
-func scanTarget(ctx context.Context, target string, opts crawler.Options, noCrawl bool, workers int, quiet bool) ([]*model.ScanResult, error) {
+func scanTarget(ctx context.Context, target string, opts crawler.Options, noCrawl bool, scanOpts scanner.ScanOptions, quiet bool) ([]*model.ScanResult, error) {
 	if strings.HasPrefix(target, "http://") || strings.HasPrefix(target, "https://") {
 		r, err := scanURLTarget(ctx, target, opts, noCrawl, quiet)
 		if err != nil {
@@ -192,9 +196,9 @@ func scanTarget(ctx context.Context, target string, opts crawler.Options, noCraw
 		return nil, fmt.Errorf("%s: %w", target, err)
 	}
 	if info.IsDir() {
-		return scanDirTarget(target, workers, quiet)
+		return scanDirTarget(target, scanOpts, quiet)
 	}
-	r, err := scanFileTarget(target, quiet)
+	r, err := scanFileTarget(target, scanOpts, quiet)
 	if err != nil {
 		return nil, err
 	}
@@ -208,18 +212,18 @@ func scanURLTarget(ctx context.Context, u string, opts crawler.Options, noCrawl,
 	return scanURL(ctx, u, opts, noCrawl)
 }
 
-func scanFileTarget(path string, quiet bool) (*model.ScanResult, error) {
+func scanFileTarget(path string, scanOpts scanner.ScanOptions, quiet bool) (*model.ScanResult, error) {
 	if !quiet {
 		fmt.Fprintf(os.Stderr, "scanning file: %s\n", path)
 	}
-	return scanner.ScanFile(path)
+	return scanner.ScanFileOpts(path, scanOpts)
 }
 
-func scanDirTarget(path string, workers int, quiet bool) ([]*model.ScanResult, error) {
+func scanDirTarget(path string, scanOpts scanner.ScanOptions, quiet bool) ([]*model.ScanResult, error) {
 	if !quiet {
 		fmt.Fprintf(os.Stderr, "scanning directory: %s\n", path)
 	}
-	return scanner.ScanDir(path, scanner.ScanOptions{Workers: workers})
+	return scanner.ScanDir(path, scanOpts)
 }
 
 func scanURL(ctx context.Context, u string, opts crawler.Options, noCrawl bool) (*model.ScanResult, error) {
@@ -227,6 +231,13 @@ func scanURL(ctx context.Context, u string, opts crawler.Options, noCrawl bool) 
 		return crawler.ScanURLBody(ctx, u, opts)
 	}
 	return scanner.ScanURL(ctx, u, opts)
+}
+
+func categoryAllowlist(onlySecrets bool, categories string) []string {
+	if onlySecrets {
+		return []string{"secret", "jwt"}
+	}
+	return splitList(categories)
 }
 
 func applyFilters(r *model.ScanResult, onlySecrets bool, categories string) *model.ScanResult {

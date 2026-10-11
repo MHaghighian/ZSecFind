@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -22,16 +23,57 @@ type Options struct {
 	Concurrency int
 	MaxDepth    int
 	UserAgent   string
+	// Categories limits extractors (empty = all). Same names as --only.
+	Categories []string
+}
+
+type linkRef struct {
+	URL        string
+	FromScript bool
 }
 
 var (
 	reHref      = regexp.MustCompile(`href=['"](.*?)['"]`)
 	reSrc       = regexp.MustCompile(`src=['"](.*?)['"]`)
-	reScriptSrc = regexp.MustCompile(`<script [^><]*?src=['"](.*?)['"]`)
+	reScriptSrc = regexp.MustCompile(`(?i)<script[^>]+src=['"](.*?)['"]`)
 )
 
-// ScanURL fetches a URL, extracts findings, and optionally crawls linked assets.
-func ScanURL(ctx context.Context, rawURL string, opts Options) (*model.ScanResult, error) {
+func defaultUserAgent() string {
+	return "ZSecFind-CLI/1.0 (DevSecOps)"
+}
+
+func newHTTPClient(timeout time.Duration, concurrency int) *http.Client {
+	if timeout <= 0 {
+		timeout = 15 * time.Second
+	}
+	if concurrency <= 0 {
+		concurrency = 8
+	}
+	perHost := concurrency
+	if perHost < 8 {
+		perHost = 8
+	}
+	transport := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   10 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   perHost,
+		MaxConnsPerHost:       perHost * 2,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+	return &http.Client{
+		Timeout:   timeout,
+		Transport: transport,
+	}
+}
+
+func normalizeOpts(opts *Options) {
 	if opts.Timeout <= 0 {
 		opts.Timeout = 15 * time.Second
 	}
@@ -39,41 +81,64 @@ func ScanURL(ctx context.Context, rawURL string, opts Options) (*model.ScanResul
 		opts.Concurrency = 8
 	}
 	if opts.UserAgent == "" {
-		opts.UserAgent = "Jsleakfind-CLI/1.0 (DevSecOps)"
+		opts.UserAgent = defaultUserAgent()
 	}
+}
+
+func extractOpts(opts Options) extractor.Options {
+	return extractor.Options{Categories: opts.Categories}
+}
+
+// ScanURL fetches a URL, extracts findings, and optionally crawls linked assets.
+func ScanURL(ctx context.Context, rawURL string, opts Options) (*model.ScanResult, error) {
+	normalizeOpts(&opts)
 
 	parsed, err := url.Parse(rawURL)
 	if err != nil {
 		return nil, fmt.Errorf("invalid url: %w", err)
 	}
 
-	client := &http.Client{Timeout: opts.Timeout}
+	client := newHTTPClient(opts.Timeout, opts.Concurrency)
 	body, err := fetch(ctx, client, rawURL, opts.UserAgent)
 	if err != nil {
 		return nil, err
 	}
+	page := string(body)
 
-	result := extractor.Extract(string(body), rawURL)
+	result := extractor.ExtractOpts(page, rawURL, extractOpts(opts))
 	result.Target = rawURL
 	result.Sources = []string{rawURL}
 
-	links := collectLinks(string(body), parsed)
-	if len(links) == 0 {
+	links := collectLinks(page, parsed)
+	// Match historical safe-mode coverage: .js paths, <script src>, or any
+	// absolute URL that appears in the HTML when the page contains a <script>
+	// (legacy isScriptTag behavior). Do not shrink the fetch set for speed.
+	hasScript := strings.Contains(page, "<script") || strings.Contains(page, "<Script")
+	toFetch := make([]string, 0, len(links))
+	seenFetch := make(map[string]struct{})
+	for _, link := range links {
+		if link.URL == rawURL {
+			continue
+		}
+		if opts.SafeMode && !shouldFetchInSafeMode(link, page, hasScript) {
+			continue
+		}
+		if _, ok := seenFetch[link.URL]; ok {
+			continue
+		}
+		seenFetch[link.URL] = struct{}{}
+		toFetch = append(toFetch, link.URL)
+	}
+	if len(toFetch) == 0 {
 		return result, nil
 	}
 
 	var mu sync.Mutex
 	sem := make(chan struct{}, opts.Concurrency)
 	var wg sync.WaitGroup
+	xopts := extractOpts(opts)
 
-	for _, link := range links {
-		if opts.SafeMode && !isJavaScript(link) && !isScriptTag(link, string(body)) {
-			continue
-		}
-		if link == rawURL {
-			continue
-		}
-
+	for _, link := range toFetch {
 		wg.Add(1)
 		go func(u string) {
 			defer wg.Done()
@@ -84,7 +149,7 @@ func ScanURL(ctx context.Context, rawURL string, opts Options) (*model.ScanResul
 			if err != nil {
 				return
 			}
-			sub := extractor.Extract(string(data), u)
+			sub := extractor.ExtractOpts(string(data), u, xopts)
 			mu.Lock()
 			result = extractor.Merge(result, sub)
 			result.Sources = append(result.Sources, u)
@@ -99,18 +164,13 @@ func ScanURL(ctx context.Context, rawURL string, opts Options) (*model.ScanResul
 
 // ScanURLBody fetches a single URL without following links.
 func ScanURLBody(ctx context.Context, rawURL string, opts Options) (*model.ScanResult, error) {
-	if opts.Timeout <= 0 {
-		opts.Timeout = 15 * time.Second
-	}
-	if opts.UserAgent == "" {
-		opts.UserAgent = "Jsleakfind-CLI/1.0 (DevSecOps)"
-	}
-	client := &http.Client{Timeout: opts.Timeout}
+	normalizeOpts(&opts)
+	client := newHTTPClient(opts.Timeout, opts.Concurrency)
 	body, err := fetch(ctx, client, rawURL, opts.UserAgent)
 	if err != nil {
 		return nil, err
 	}
-	r := extractor.Extract(string(body), rawURL)
+	r := extractor.ExtractOpts(string(body), rawURL, extractOpts(opts))
 	r.Target = rawURL
 	r.Sources = []string{rawURL}
 	return r, nil
@@ -150,30 +210,39 @@ func fetch(ctx context.Context, client *http.Client, u, ua string) ([]byte, erro
 	return data, nil
 }
 
-func collectLinks(source string, base *url.URL) []string {
-	seen := make(map[string]struct{})
-	var out []string
+func collectLinks(source string, base *url.URL) []linkRef {
+	seen := make(map[string]*linkRef)
+	var order []string
 
-	add := func(raw string) {
+	add := func(raw string, fromScript bool) {
 		resolved := resolveURL(base, raw)
 		if resolved == "" {
 			return
 		}
-		if _, ok := seen[resolved]; ok {
+		if existing, ok := seen[resolved]; ok {
+			if fromScript {
+				existing.FromScript = true
+			}
 			return
 		}
-		seen[resolved] = struct{}{}
-		out = append(out, resolved)
+		ref := &linkRef{URL: resolved, FromScript: fromScript}
+		seen[resolved] = ref
+		order = append(order, resolved)
 	}
 
 	for _, m := range reHref.FindAllStringSubmatch(source, -1) {
-		add(m[1])
+		add(m[1], false)
 	}
 	for _, m := range reSrc.FindAllStringSubmatch(source, -1) {
-		add(m[1])
+		add(m[1], false)
 	}
 	for _, m := range reScriptSrc.FindAllStringSubmatch(source, -1) {
-		add(m[1])
+		add(m[1], true)
+	}
+
+	out := make([]linkRef, 0, len(order))
+	for _, u := range order {
+		out = append(out, *seen[u])
 	}
 	return out
 }
@@ -198,8 +267,14 @@ func isJavaScript(u string) bool {
 	return strings.HasSuffix(strings.ToLower(parsed.Path), ".js")
 }
 
-func isScriptTag(u, source string) bool {
-	return strings.Contains(source, `<script`) && strings.Contains(source, u)
+// shouldFetchInSafeMode preserves pre-optimization crawl coverage.
+// Historical rule: fetch .js, script src, or links whose absolute URL appears
+// in the page HTML when any <script> is present.
+func shouldFetchInSafeMode(link linkRef, page string, hasScript bool) bool {
+	if link.FromScript || isJavaScript(link.URL) {
+		return true
+	}
+	return hasScript && strings.Contains(page, link.URL)
 }
 
 func unique(items []string) []string {

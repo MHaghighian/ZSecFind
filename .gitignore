@@ -18,3 +18,4 @@ Thumbs.db
 
 # Test artifacts (optional local runs)
 # testdata/scan-result.json
+/bench/

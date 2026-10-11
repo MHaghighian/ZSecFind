@@ -19,15 +19,22 @@ import (
 type ScanOptions struct {
 	Workers    int
 	Extensions []string
+	// Categories limits extractors (empty = all). Same names as --only.
+	Categories []string
 }
 
 // ScanFile reads a local file and extracts findings.
 func ScanFile(path string) (*model.ScanResult, error) {
+	return ScanFileOpts(path, ScanOptions{})
+}
+
+// ScanFileOpts reads a local file with optional category filtering at extract time.
+func ScanFileOpts(path string, opts ScanOptions) (*model.ScanResult, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
-	r := extractor.Extract(string(data), path)
+	r := extractor.ExtractOpts(string(data), path, extractor.Options{Categories: opts.Categories})
 	r.Target = path
 	r.Sources = []string{path}
 	return r, nil
@@ -87,7 +94,7 @@ func ScanDir(root string, opts ScanOptions) ([]*model.ScanResult, error) {
 		go func() {
 			defer wg.Done()
 			for path := range jobs {
-				r, scanErr := ScanFile(path)
+				r, scanErr := ScanFileOpts(path, opts)
 				if scanErr != nil {
 					continue
 				}
@@ -124,5 +131,13 @@ func ScanURL(ctx context.Context, u string, opts crawler.Options) (*model.ScanRe
 
 // ScanContent scans in-memory content.
 func ScanContent(content, source string) *model.ScanResult {
-	return crawler.ScanContent(content, source)
+	return ScanContentOpts(content, source, ScanOptions{})
+}
+
+// ScanContentOpts scans in-memory content with optional category filtering.
+func ScanContentOpts(content, source string, opts ScanOptions) *model.ScanResult {
+	r := extractor.ExtractOpts(content, source, extractor.Options{Categories: opts.Categories})
+	r.Target = source
+	r.Sources = []string{source}
+	return r
 }

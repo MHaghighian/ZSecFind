@@ -8,11 +8,22 @@ import (
 	"github.com/l4tr0d3ctism/ZSecFind/internal/model"
 )
 
-// Extract runs all Jsleakfind regex rules against content.
+// Options controls what Extract runs. Empty Categories means all categories.
+type Options struct {
+	Categories []string
+}
+
+// Extract runs all regex rules against content.
 func Extract(content, source string) *model.ScanResult {
+	return ExtractOpts(content, source, Options{})
+}
+
+// ExtractOpts runs selected category matchers against content.
+func ExtractOpts(content, source string, opts Options) *model.ScanResult {
 	initPatterns()
 
-	raw := extractRaw(content, source)
+	want := categorySet(opts.Categories)
+	raw := extractRaw(content, source, want)
 	result := &model.ScanResult{
 		Stats: make(map[string]int),
 	}
@@ -71,6 +82,30 @@ func Extract(content, source string) *model.ScanResult {
 	return result
 }
 
+func categorySet(categories []string) map[string]bool {
+	if len(categories) == 0 {
+		return nil
+	}
+	want := make(map[string]bool, len(categories))
+	for _, c := range categories {
+		c = strings.ToLower(strings.TrimSpace(c))
+		if c != "" {
+			want[c] = true
+		}
+	}
+	if len(want) == 0 {
+		return nil
+	}
+	return want
+}
+
+func wantCategory(want map[string]bool, name string) bool {
+	if want == nil {
+		return true
+	}
+	return want[name]
+}
+
 // Merge combines two scan results (e.g. page + linked JS files).
 func Merge(base, other *model.ScanResult) *model.ScanResult {
 	if base == nil {
@@ -119,38 +154,76 @@ func filterMailFindings(items []model.Finding) []model.Finding {
 	return out
 }
 
-func extractRaw(data, source string) map[string][]model.Finding {
-	out := map[string][]model.Finding{
-		"sfz":             findingsFromRegex(reSFZ, data, source, "sfz"),
-		"mobile":          findingsFromRegex(reMobile, data, source, "mobile"),
-		"mail":            findingsFromRegex(reMail, data, source, "mail"),
-		"ip":              findingsFromRegex(reIP, data, source, "ip"),
-		"ip_port":         findingsFromRegex(reIPPort, data, source, "ip_port"),
-		"domain":          findingsFromRegex(reDomain, data, source, "domain"),
-		"path":            findingsFromRegex(rePath, data, source, "path"),
-		"incomplete_path": findingsFromRegex(reIncompletePath, data, source, "incomplete_path"),
-		"url":             findingsFromRegex(reURL, data, source, "url"),
-		"jwt":             findingsFromRegex(reJWT, data, source, "jwt"),
-		"algorithm":       findingsFromRegex(reAlgorithm, data, source, "algorithm"),
-		"secret":          extractSecrets(data, source),
+func extractRaw(data, source string, want map[string]bool) map[string][]model.Finding {
+	out := make(map[string][]model.Finding)
+	lineStarts := buildLineStarts(data)
+
+	if wantCategory(want, "sfz") {
+		out["sfz"] = findingsFromRegex(reSFZ, data, source, "sfz", lineStarts)
+	}
+	if wantCategory(want, "mobile") {
+		out["mobile"] = findingsFromRegex(reMobile, data, source, "mobile", lineStarts)
+	}
+	if wantCategory(want, "mail") {
+		out["mail"] = findingsFromRegex(reMail, data, source, "mail", lineStarts)
+	}
+	if wantCategory(want, "ip") {
+		out["ip"] = findingsFromRegex(reIP, data, source, "ip", lineStarts)
+	}
+	if wantCategory(want, "ip_port") {
+		out["ip_port"] = findingsFromRegex(reIPPort, data, source, "ip_port", lineStarts)
+	}
+	if wantCategory(want, "domain") {
+		out["domain"] = findingsFromRegex(reDomain, data, source, "domain", lineStarts)
+	}
+	if wantCategory(want, "path") {
+		out["path"] = findingsFromRegex(rePath, data, source, "path", lineStarts)
+	}
+	if wantCategory(want, "incomplete_path") {
+		out["incomplete_path"] = findingsFromRegex(reIncompletePath, data, source, "incomplete_path", lineStarts)
+	}
+	if wantCategory(want, "url") {
+		out["url"] = findingsFromRegex(reURL, data, source, "url", lineStarts)
+	}
+	if wantCategory(want, "jwt") {
+		out["jwt"] = findingsFromRegex(reJWT, data, source, "jwt", lineStarts)
+	}
+	if wantCategory(want, "algorithm") {
+		out["algorithm"] = findingsFromRegex(reAlgorithm, data, source, "algorithm", lineStarts)
+	}
+	if wantCategory(want, "secret") {
+		out["secret"] = extractSecrets(data, source, lineStarts)
 	}
 
+	// URL-derived IP/domain enrichment only when those categories are wanted.
 	if urls := out["url"]; len(urls) > 0 {
 		for _, u := range urls {
-			out["ip"] = mergeFindings(out["ip"], findingsFromRegex(reIPInURL, u.Value, source, "ip_in_url"))
-			out["ip_port"] = mergeFindings(out["ip_port"], findingsFromRegex(reIPPortInURL, u.Value, source, "ip_port_in_url"))
-			out["domain"] = mergeFindings(out["domain"], findingsFromRegex(reDomainInURL, u.Value, source, "domain_in_url"))
+			if wantCategory(want, "ip") {
+				out["ip"] = mergeFindings(out["ip"], findingsFromRegex(reIPInURL, u.Value, source, "ip_in_url", nil))
+			}
+			if wantCategory(want, "ip_port") {
+				out["ip_port"] = mergeFindings(out["ip_port"], findingsFromRegex(reIPPortInURL, u.Value, source, "ip_port_in_url", nil))
+			}
+			if wantCategory(want, "domain") {
+				out["domain"] = mergeFindings(out["domain"], findingsFromRegex(reDomainInURL, u.Value, source, "domain_in_url", nil))
+			}
 		}
 	}
 	return out
 }
 
-func extractSecrets(data, source string) []model.Finding {
+func extractSecrets(data, source string, lineStarts []int) []model.Finding {
 	seen := make(map[string]struct{})
 	var result []model.Finding
-	lineStarts := buildLineStarts(data)
+	if lineStarts == nil {
+		lineStarts = buildLineStarts(data)
+	}
 
-	for i := len(secretPatterns) - 1; i >= 0; i-- {
+	indices := secretIndex.eligibleSecretIndices(data)
+	// Match prior reverse-iteration preference: higher index (later-loaded curated) first.
+	sort.Slice(indices, func(i, j int) bool { return indices[i] > indices[j] })
+
+	for _, i := range indices {
 		sp := secretPatterns[i]
 		for _, idx := range sp.re.FindAllStringIndex(data, -1) {
 			value := data[idx[0]:idx[1]]
